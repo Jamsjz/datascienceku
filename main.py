@@ -411,7 +411,7 @@ def admin_auth_before(req, sess):
 
 
 beforeware = Beforeware(admin_auth_before, skip=[r"/admin/login", r"/static/.*"])
-app, rt = fast_app(before=beforeware, pico=True)
+app, rt = fast_app(before=beforeware, pico=True, live=False, debug=False)
 
 # === ADMIN LOGIN ===
 
