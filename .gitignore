@@ -1,0 +1,9 @@
+# Add to .gitignore
+kuclasses.json
+*.json
+credentials/
+Data_Science/
+temp_uploads/
+__pycache__/
+.env
+.sesskey
