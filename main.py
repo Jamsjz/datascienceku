@@ -182,21 +182,6 @@ def initialize_drive():
         raise
 
 
-# === APPLICATION INITIALIZATION ===
-# Initialize Drive
-try:
-    SEMESTER_FOLDER_IDS = initialize_drive()
-    print("Drive initialization successful")
-except Exception as e:
-    print(f"Fatal error during initialization: {str(e)}")
-    print("Cannot continue without proper Drive access")
-    exit(1)
-
-
-# Ensure temp uploads directory exists
-TEMP_UPLOADS = Path("temp_uploads")
-TEMP_UPLOADS.mkdir(exist_ok=True)
-
 # === HELPER FUNCTIONS ===
 
 
@@ -832,6 +817,19 @@ def download_file(req):
         return PlainTextResponse("Invalid file parameter", status_code=400)
 
 
-# === RUN THE APP ===
+# === APPLICATION INITIALIZATION ===
+# Initialize Drive
+try:
+    SEMESTER_FOLDER_IDS = initialize_drive()
+    print("Drive initialization successful")
+except Exception as e:
+    print(f"Fatal error during initialization: {str(e)}")
+    print("Cannot continue without proper Drive access")
+    exit(1)
 
+
+# Ensure temp uploads directory exists
+TEMP_UPLOADS = Path("temp_uploads")
+TEMP_UPLOADS.mkdir(exist_ok=True)
+# === RUN THE APP ===
 serve()
