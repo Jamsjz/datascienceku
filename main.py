@@ -1,18 +1,18 @@
-from fasthtml.common import *
-import os
+import datetime
 import io
+import os
+import shutil
+import tempfile
 import uuid
 import zipfile
-import pytz
-import datetime
-import tempfile
-import shutil
 from pathlib import Path
+
+import pytz
+from dotenv import load_dotenv
+from fasthtml.common import *
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from dotenv import load_dotenv
-from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
-
+from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 
 # === CONFIGURATION ===
 load_dotenv()
@@ -571,7 +571,7 @@ async def admin_upload_resolve(req, session):
         temp_file.unlink()
         add_toast(
             session,
-            f"Replaced file in Drive",
+            "Replaced file in Drive",
             "success",
         )
         return RedirectResponse("/admin")
@@ -583,7 +583,7 @@ async def admin_upload_resolve(req, session):
             temp_file.unlink()
             add_toast(
                 session,
-                f"Merged new zip in Drive",
+                "Merged new zip in Drive",
                 "success",
             )
             return RedirectResponse("/admin")
