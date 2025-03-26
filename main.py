@@ -685,7 +685,7 @@ async def admin_delete(req, session):
 @rt("/")
 def user_index(req):
     return Titled(
-        "Class Repository",
+        "Data Science Resources",
         Ul(*[Li(A(f"Semester {i}", href=f"/semester/{i}")) for i in range(1, 9)]),
         P(A("Admin Login", href="/admin/login")),
     )
@@ -735,7 +735,7 @@ async def semester_view(req: Request, num: int):
         P(A("Back to Home", href="/")),
     ]
 
-    return Titled(f"Semester {num} Files", Form(*form_content, method="post"))
+    return Titled(f"Semester {num}", Form(*form_content, method="post"))
 
 
 @rt("/semester", methods=["GET", "POST"])
