@@ -428,6 +428,10 @@ def admin_dashboard(req, session):
     files = list_recent_uploads()
     return Titled(
         "Admin Dashboard",
+        Div(
+            P("Note: Files can only be deleted within 24 hours of upload"),
+            style="margin-bottom: 20px; color: #666;",
+        ),
         Ul(
             *[
                 Li(
@@ -441,7 +445,232 @@ def admin_dashboard(req, session):
     )
 
 
-# === FILE UPLOAD AND CONFLICT RESOLUTION ===
+@rt("/admin/upload", methods=["POST"])
+async def admin_upload_process(req, session):
+    """Handle file uploads with validation and conflict resolution"""
+    form = await req.form()
+    file = form.get("file")
+    semester = form.get("semester")
+    batch_year = form.get("batch_year")
+
+    # Validate required fields
+    if not all([file, semester, batch_year]):
+        add_toast(session, "Missing required fields", "error")
+        return RedirectResponse("/admin/upload", status_code=303)
+
+    filename = f"{batch_year}.zip"  # Enforce naming convention
+
+    # Client-side validation (should match server-side)
+    if not file.filename.lower().endswith(".zip"):
+        add_toast(session, "Only .zip files are allowed", "error")
+        return RedirectResponse("/admin/upload", status_code=303)
+
+    if file.size > 50 * 1024 * 1024:  # 50MB
+        add_toast(session, "File exceeds maximum size of 50MB", "error")
+        return RedirectResponse("/admin/upload", status_code=303)
+
+    try:
+        file_bytes = await file.read()
+
+        # Verify ZIP integrity before processing
+        try:
+            with zipfile.ZipFile(io.BytesIO(file_bytes)) as zip_ref:
+                if zip_ref.testzip() is not None:
+                    raise ValueError("ZIP file contains corrupt files")
+        except zipfile.BadZipfile:
+            add_toast(session, "Invalid ZIP file format", "error")
+            return RedirectResponse("/admin/upload", status_code=303)
+
+        # Check for existing file
+        existing_files = list_files_in_semester(semester)
+        existing_file = next(
+            (f for f in existing_files if f["filename"] == filename), None
+        )
+
+        if not existing_file:
+            # New upload
+            try:
+                file_id = upload_file_to_drive(file_bytes, filename, semester)
+                add_toast(
+                    session,
+                    f"Successfully uploaded {filename} to {semester}",
+                    "success",
+                )
+                return RedirectResponse("/admin")
+            except Exception as e:
+                add_toast(session, f"Upload failed: {str(e)}", "error")
+                return RedirectResponse("/admin/upload", status_code=303)
+        else:
+            # Conflict resolution needed
+            temp_path = TEMP_UPLOADS / f"temp_{uuid.uuid4().hex}.zip"
+            try:
+                temp_path.write_bytes(file_bytes)
+                return conflict_resolution_page(
+                    temp_path=temp_path,
+                    existing_file_id=existing_file["filepath"],
+                    batch_year=batch_year,
+                    semester=semester,
+                )
+            except Exception as e:
+                if temp_path.exists():
+                    temp_path.unlink()
+                add_toast(
+                    session,
+                    f"Error preparing for conflict resolution: {str(e)}",
+                    "error",
+                )
+                return RedirectResponse("/admin/upload", status_code=303)
+
+    except Exception as e:
+        add_toast(session, f"Upload processing failed: {str(e)}", "error")
+        return RedirectResponse("/admin/upload", status_code=303)
+
+
+@rt("/admin/upload", methods=["GET"])
+async def admin_upload_form(req, session):
+    """Handle GET requests for the upload form"""
+    years = [str(datetime.datetime.utcnow().year - i) for i in range(6)]
+    return Titled(
+        "Upload File",
+        Div(
+            H3("Upload Rules:"),
+            Ul(
+                Li("Only .zip files are allowed"),
+                Li("Maximum file size: 50MB"),
+                Li("Files can be deleted within 24 hours of upload"),
+                Li(
+                    "Old files (up to 5 years) can be replaced by uploading new versions"
+                ),
+            ),
+            style="margin-bottom: 20px;",
+        ),
+        Form(
+            id="uploadForm",
+            enctype="multipart/form-data",
+            method="post",
+            onsubmit="return validateFile()",
+        )(
+            Label(
+                "Semester",
+                Select(
+                    *[
+                        Option(f"Semester {i}", value=f"Semester_{i}")
+                        for i in range(1, 9)
+                    ],
+                    name="semester",
+                    required=True,
+                ),
+            ),
+            Label(
+                "Batch Year",
+                Select(
+                    *[Option(y, value=y) for y in years],
+                    name="batch_year",
+                    required=True,
+                ),
+            ),
+            Label(
+                "File (zip only, max 50MB)",
+                Input(
+                    id="fileInput",
+                    name="file",
+                    type="file",
+                    accept=".zip",
+                    required=True,
+                ),
+            ),
+            Div(id="errorMsg", style="color: red; margin: 10px 0;"),
+            Button("Upload", type="submit"),
+        ),
+        Script("""
+            function validateFile() {
+                const fileInput = document.getElementById('fileInput');
+                const errorDiv = document.getElementById('errorMsg');
+                errorDiv.textContent = '';
+                
+                if (fileInput.files.length === 0) {
+                    errorDiv.textContent = 'Please select a file';
+                    return false;
+                }
+                
+                const file = fileInput.files[0];
+                const maxSize = 50 * 1024 * 1024; // 50MB
+                
+                // Check file extension
+                if (!file.name.toLowerCase().endsWith('.zip')) {
+                    errorDiv.textContent = 'Only .zip files are allowed';
+                    return false;
+                }
+                
+                // Check file size
+                if (file.size > maxSize) {
+                    errorDiv.textContent = 'File exceeds maximum size of 50MB';
+                    return false;
+                }
+                
+                return true;
+            }
+        """),
+    )
+
+
+@rt("/admin/upload/resolve", methods=["POST"])
+async def admin_upload_resolve(req, session):
+    form = await req.form()
+    temp_file, existing_file_id = Path(form["temp"]), form["existing"]
+    action, confirm1, confirm2 = (
+        form["action"],
+        form.get("confirm1", ""),
+        form.get("confirm2", ""),
+    )
+    semester = form.get("semester")
+    batch_year = form.get("batch_year")  # Get batch_year from form
+
+    if not semester or not batch_year:
+        add_toast(session, "Missing semester or batch year", "error")
+        return RedirectResponse("/admin/upload", status_code=303)
+
+    filename = f"{batch_year}.zip"  # Proper filename
+
+    if action == "remove" and confirm1 == "REMOVE" and confirm2 == "REMOVE":
+        try:
+            # Delete existing file
+            DRIVE_SERVICE.files().delete(fileId=existing_file_id).execute()
+
+            # Upload new file with proper name
+            with open(temp_file, "rb") as f:
+                file_bytes = f.read()
+            upload_file_to_drive(file_bytes, filename, semester)
+
+            temp_file.unlink()
+            add_toast(session, f"Replaced {filename} in Drive", "success")
+            return RedirectResponse("/admin")
+        except Exception as e:
+            add_toast(session, f"Error during replacement: {str(e)}", "error")
+            if temp_file.exists():
+                temp_file.unlink()
+            return RedirectResponse("/admin/upload", status_code=303)
+
+    elif action == "merge":
+        try:
+            with open(temp_file, "rb") as f:
+                new_file_bytes = f.read()
+            merge_zip_files_in_drive(existing_file_id, new_file_bytes)
+            temp_file.unlink()
+            add_toast(session, f"Merged new content into {filename}", "success")
+            return RedirectResponse("/admin")
+        except Exception as e:
+            add_toast(session, f"Merge failed: {str(e)}", "error")
+            if temp_file.exists():
+                temp_file.unlink()
+            return RedirectResponse("/admin/upload", status_code=303)
+
+    if temp_file.exists():
+        temp_file.unlink()
+    add_toast(session, "Resolution not confirmed or invalid action.", "error")
+    return RedirectResponse("/admin/upload", status_code=303)
+
+
 def conflict_resolution_page(temp_path, existing_file_id, batch_year, semester):
     return Titled(
         "Conflict Resolution",
@@ -451,6 +680,8 @@ def conflict_resolution_page(temp_path, existing_file_id, batch_year, semester):
         Form(method="post", action="/admin/upload/resolve")(
             Input(name="temp", type="hidden", value=str(temp_path)),
             Input(name="existing", type="hidden", value=existing_file_id),
+            Input(name="semester", type="hidden", value=semester),
+            Input(name="batch_year", type="hidden", value=batch_year),  # Add batch_year
             Label(
                 "Resolution",
                 Select(
@@ -470,131 +701,6 @@ def conflict_resolution_page(temp_path, existing_file_id, batch_year, semester):
             Button("Resolve", type="submit"),
         ),
     )
-
-
-@rt("/admin/upload", methods=["GET"])
-async def admin_upload_form(req, session):
-    """Handle GET requests for the upload form"""
-    years = [str(datetime.datetime.utcnow().year - i) for i in range(6)]
-    return Titled(
-        "Upload File",
-        Form(enctype="multipart/form-data", method="post")(
-            Label(
-                "Semester",
-                Select(
-                    *[
-                        Option(f"Semester {i}", value=f"Semester_{i}")
-                        for i in range(1, 9)
-                    ],
-                    name="semester",
-                ),
-            ),
-            Label(
-                "Batch Year",
-                Select(*[Option(y, value=y) for y in years], name="batch_year"),
-            ),
-            Label(
-                "File (zip, max 50MB)",
-                Input(name="file", type="file", accept=".zip"),
-            ),
-            Button("Upload", type="submit"),
-        ),
-    )
-
-
-@rt("/admin/upload", methods=["POST"])
-async def admin_upload_process(req, session):
-    """Handle POST requests for file uploads"""
-    form = await req.form()
-    file = form.get("file")
-    semester, batch_year = form.get("semester"), form.get("batch_year")
-    filename = f"{batch_year}.zip"
-
-    print(f"Upload request received for {semester}/{filename}")
-
-    if not filename.lower().endswith(".zip"):
-        add_toast(session, "Only zip files allowed", "error")
-        return RedirectResponse("/admin/upload", status_code=303)
-
-    if file.size > 50 * 1024 * 1024:
-        add_toast(session, "File exceeds maximum size of 50MB", "error")
-        return RedirectResponse("/admin/upload", status_code=303)
-
-    try:
-        file_bytes = await file.read()
-        print(f"Read {len(file_bytes)} bytes from uploaded file")
-
-        existing_files = list_files_in_semester(semester)
-        print(f"Found {len(existing_files)} existing files in {semester}")
-        existing_file = next(
-            (f for f in existing_files if f["filename"] == filename), None
-        )
-
-        if not existing_file:
-            try:
-                file_id = upload_file_to_drive(file_bytes, filename, semester)
-                add_toast(session, f"Uploaded {filename} to {semester}", "success")
-                print(f"Upload successful, file ID: {file_id}")
-                return RedirectResponse("/admin")
-            except Exception as e:
-                add_toast(session, f"Upload failed: {str(e)}", "error")
-                return RedirectResponse("/admin/upload", status_code=303)
-        else:
-            temp_path = TEMP_UPLOADS / f"{uuid.uuid4().hex}.zip"
-            temp_path.write_bytes(file_bytes)
-            print(f"Conflict detected, temporary file saved to {temp_path}")
-            return conflict_resolution_page(
-                temp_path, existing_file["filepath"], batch_year, semester
-            )
-
-    except Exception as e:
-        add_toast(session, f"Upload processing failed: {str(e)}", "error")
-        return RedirectResponse("/admin/upload", status_code=303)
-
-
-@rt("/admin/upload/resolve", methods=["POST"])
-async def admin_upload_resolve(req, session):
-    form = await req.form()
-    temp_file, existing_file_id = Path(form["temp"]), form["existing"]
-    action, confirm1, confirm2 = (
-        form["action"],
-        form.get("confirm1", ""),
-        form.get("confirm2", ""),
-    )
-
-    if action == "remove" and confirm1 == "REMOVE" and confirm2 == "REMOVE":
-        # Delete existing file and upload new one
-        DRIVE_SERVICE.files().delete(fileId=existing_file_id).execute()
-        with open(temp_file, "rb") as f:
-            file_bytes = f.read()
-        upload_file_to_drive(file_bytes, temp_file.name, "Semester")
-        temp_file.unlink()
-        add_toast(
-            session,
-            "Replaced file in Drive",
-            "success",
-        )
-        return RedirectResponse("/admin")
-    elif action == "merge":
-        try:
-            with open(temp_file, "rb") as f:
-                new_file_bytes = f.read()
-            merge_zip_files_in_drive(existing_file_id, new_file_bytes)
-            temp_file.unlink()
-            add_toast(
-                session,
-                "Merged new zip in Drive",
-                "success",
-            )
-            return RedirectResponse("/admin")
-        except Exception as e:
-            add_toast(session, f"Merge failed: {str(e)}", "error")
-            temp_file.unlink()
-            return RedirectResponse("/admin/upload", status_code=303)
-
-    temp_file.unlink()
-    add_toast(session, "Resolution not confirmed or invalid action.", "error")
-    return RedirectResponse("/admin/upload", status_code=303)
 
 
 @rt("/admin/delete", methods=["GET", "POST"])
@@ -724,7 +830,7 @@ async def semester_view(req: Request, num: int):
                 value="selected",
                 formaction=f"/semester/{num}/download",
                 id="selectedButton",
-                style="display: none;",
+                style="display: none; margin-right: 10px;",
             ),
             Button(
                 "Download All",
@@ -732,16 +838,25 @@ async def semester_view(req: Request, num: int):
                 name="action",
                 value="all",
                 formaction=f"/semester/{num}/download",
+                id="downloadAllButton",
+                style="display: none;",
             ),
             Script(
                 """
                 document.addEventListener('DOMContentLoaded', function() {
                     const checkboxes = document.querySelectorAll('input[name="selected"]');
                     const selectedButton = document.getElementById('selectedButton');
+                    const downloadAllButton = document.getElementById('downloadAllButton');
                     
                     function updateButtonVisibility() {
                         const anyChecked = Array.from(checkboxes).some(cb => cb.checked);
-                        selectedButton.style.display = anyChecked ? 'inline-block' : 'none';
+                        if (anyChecked) {
+                            selectedButton.style.display = 'inline-block';
+                            downloadAllButton.style.display = 'inline-block';
+                        } else {
+                            selectedButton.style.display = 'none';
+                            downloadAllButton.style.display = 'none';
+                        }
                     }
                     
                     checkboxes.forEach(checkbox => {
