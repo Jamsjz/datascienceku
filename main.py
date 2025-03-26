@@ -425,24 +425,134 @@ async def admin_login(req, session):
 
 @rt("/admin")
 def admin_dashboard(req, session):
-    files = list_recent_uploads()
-    return Titled(
-        "Admin Dashboard",
-        Div(
-            P("Note: Files can only be deleted within 24 hours of upload"),
-            style="margin-bottom: 20px; color: #666;",
-        ),
-        Ul(
-            *[
-                Li(
-                    f"{f['semester']}/{f['filename']} (Uploaded at {f['modified']}) ",
-                    A("Delete", href=f"/admin/delete?file={f['filepath']}"),
+    """Admin dashboard with timezone-aware datetime display"""
+    try:
+        # Get the user's timezone from cookies or default to UTC
+        user_timezone = req.cookies.get("timezone", "UTC")
+        try:
+            tz = pytz.timezone(user_timezone)
+        except pytz.UnknownTimeZoneError:
+            tz = pytz.UTC
+
+        # Get recent uploads (last 24 hours in server time)
+        cutoff = datetime.datetime.utcnow() - datetime.timedelta(hours=24)
+        all_files = []
+
+        for semester, folder_id in SEMESTER_FOLDER_IDS.items():
+            try:
+                results = (
+                    DRIVE_SERVICE.files()
+                    .list(
+                        q=f"'{folder_id}' in parents and modifiedTime > '{cutoff.isoformat()}Z'",
+                        fields="files(id, name, modifiedTime, mimeType, size)",
+                        orderBy="modifiedTime desc",
+                    )
+                    .execute()
                 )
-                for f in files
-            ]
-        ),
-        P(A("Upload New File", href="/admin/upload")),
-    )
+
+                for file in results.get("files", []):
+                    # Parse the UTC time from Google Drive
+                    utc_time = datetime.datetime.fromisoformat(
+                        file["modifiedTime"].replace("Z", "+00:00")
+                    ).replace(tzinfo=pytz.UTC)
+
+                    # Convert to user's local timezone
+                    local_time = utc_time.astimezone(tz)
+
+                    # Format the display time
+                    formatted_time = local_time.strftime("%Y-%m-%d %H:%M")
+
+                    # Convert size
+                    size_mb = (
+                        round(int(file.get("size", 0)) / (1024 * 1024), 2)
+                        if "size" in file
+                        else 0
+                    )
+
+                    all_files.append(
+                        {
+                            "semester": semester.replace("_", " "),
+                            "filename": file["name"],
+                            "file_id": file["id"],
+                            "modified": formatted_time,
+                            "size": f"{size_mb} MB" if size_mb > 0 else "N/A",
+                            "type": file["mimeType"],
+                        }
+                    )
+            except Exception as e:
+                print(f"Error listing files for {semester}: {str(e)}")
+                continue
+
+        return Titled(
+            "Admin Dashboard",
+            Div(
+                P(
+                    f"Note: Files can only be deleted within 24 hours of upload (Displaying times in {tz.zone})",
+                    style="color: #d9534f; font-weight: bold;",
+                ),
+                style="margin-bottom: 20px;",
+            ),
+            Table(
+                Thead(
+                    Tr(
+                        Th("Semester"),
+                        Th("Filename"),
+                        Th("Modified"),
+                        Th("Size"),
+                        Th("Type"),
+                        Th("Actions"),
+                    )
+                ),
+                Tbody(
+                    *[
+                        Tr(
+                            Td(file["semester"]),
+                            Td(file["filename"]),
+                            Td(file["modified"]),
+                            Td(file["size"]),
+                            Td(
+                                "ZIP Archive" if "zip" in file["type"] else file["type"]
+                            ),
+                            Td(
+                                A(
+                                    "Delete",
+                                    href=f"/admin/delete?file={file['file_id']}",
+                                    style="color: #d9534f;",
+                                )
+                            ),
+                        )
+                        for file in sorted(
+                            all_files, key=lambda x: x["modified"], reverse=True
+                        )
+                    ]
+                ),
+            )
+            if all_files
+            else P("No recent uploads found in the last 24 hours"),
+            Div(
+                A("Upload New File", href="/admin/upload", class_="btn btn-primary"),
+                style="margin-top: 30px;",
+            ),
+            Script("""
+                // Try to detect user's timezone
+                try {
+                    const userTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+                    document.cookie = `timezone=${userTimezone}; path=/; max-age=${60*60*24*365}`;
+                } catch (e) {
+                    console.log("Could not detect timezone", e);
+                }
+            """),
+        )
+    except Exception as e:
+        print(f"Error loading admin dashboard: {str(e)}")
+        return Titled(
+            "Admin Dashboard",
+            P(
+                "Error loading recent uploads. Please try again later.",
+                style="color: red;",
+            ),
+            A("Back to Upload", href="/admin/upload"),
+        )
 
 
 @rt("/admin/upload", methods=["POST"])
