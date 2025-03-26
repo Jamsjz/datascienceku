@@ -180,9 +180,7 @@ def initialize_drive():
                 "4. For Shared Drives, ensure the service account is added as a member"
             )
         raise
-
-
-# === HELPER FUNCTIONS ===
+        # === HELPER FUNCTIONS ===
 
 
 def merge_zip_files(existing_path: Path, new_zip_path: Path):
@@ -473,29 +471,38 @@ def conflict_resolution_page(temp_path, existing_file_id, batch_year, semester):
 
 
 @rt("/admin/upload", methods=["GET"])
-async def admin_upload_form(req, session):
-    """Handle GET requests for the upload form"""
-    years = [str(datetime.datetime.utcnow().year - i) for i in range(6)]
+async def admin_upload_form(req):
+    """Handles the file upload form display."""
+    semesters = list(SEMESTER_FOLDER_IDS.keys())
+    current_year = datetime.datetime.now().year
+    batch_years = list(range(current_year - 5, current_year + 1))  # Example range
+
     return Titled(
-        "Upload File",
-        Form(enctype="multipart/form-data", method="post")(
+        "Admin Upload",
+        Form(
+            method="post",
+            action="/admin/upload",
+            enctype="multipart/form-data",
+            _id="uploadForm",
+        )(
+            Label("File", Input(type="file", name="file", _id="fileInput")),
             Label(
                 "Semester",
                 Select(
-                    *[
-                        Option(f"Semester {i}", value=f"Semester_{i}")
-                        for i in range(1, 9)
-                    ],
+                    *[Option(semester, value=semester) for semester in semesters],
                     name="semester",
+                    _id="semesterSelect",
                 ),
             ),
             Label(
                 "Batch Year",
-                Select(*[Option(y, value=y) for y in years], name="batch_year"),
-            ),
-            Label(
-                "File (zip, max 50MB)",
-                Input(name="file", type="file", accept=".zip"),
+                Select(
+                    *[
+                        Option(year, value=year) for year in batch_years
+                    ],  # Use batch_years
+                    name="batch_year",
+                    _id="batchYearSelect",
+                ),
             ),
             Button("Upload", type="submit"),
         ),
@@ -503,333 +510,263 @@ async def admin_upload_form(req, session):
 
 
 @rt("/admin/upload", methods=["POST"])
-async def admin_upload_process(req, session):
-    """Handle POST requests for file uploads"""
+async def admin_upload(req):
+    """Handles file uploads, including conflict resolution."""
     form = await req.form()
     file = form.get("file")
-    semester, batch_year = form.get("semester"), form.get("batch_year")
-    filename = f"{batch_year}.zip"
+    semester = form.get("semester")
+    batch_year = form.get("batch_year")
 
-    print(f"Upload request received for {semester}/{filename}")
+    if not file or not semester or not batch_year:
+        return Titled("Error", P("Missing file or semester."))
 
-    if not filename.lower().endswith(".zip"):
-        add_toast(session, "Only zip files allowed", "error")
-        return RedirectResponse("/admin/upload", status_code=303)
-
-    if file.size > 50 * 1024 * 1024:
-        add_toast(session, "File exceeds maximum size of 50MB", "error")
-        return RedirectResponse("/admin/upload", status_code=303)
+    filename = file.filename
+    file_bytes = await file.read()
 
     try:
-        file_bytes = await file.read()
-        print(f"Read {len(file_bytes)} bytes from uploaded file")
-
         existing_files = list_files_in_semester(semester)
-        print(f"Found {len(existing_files)} existing files in {semester}")
-        existing_file = next(
-            (f for f in existing_files if f["filename"] == filename), None
+        existing_zip = next(
+            (f for f in existing_files if f["filename"] == f"{batch_year}_batch.zip"),
+            None,
         )
 
-        if not existing_file:
-            try:
-                file_id = upload_file_to_drive(file_bytes, filename, semester)
-                add_toast(session, f"Uploaded {filename} to {semester}", "success")
-                print(f"Upload successful, file ID: {file_id}")
-                return RedirectResponse("/admin")
-            except Exception as e:
-                add_toast(session, f"Upload failed: {str(e)}", "error")
-                return RedirectResponse("/admin/upload", status_code=303)
-        else:
-            temp_path = TEMP_UPLOADS / f"{uuid.uuid4().hex}.zip"
-            temp_path.write_bytes(file_bytes)
-            print(f"Conflict detected, temporary file saved to {temp_path}")
+        if existing_zip:
+            # Handle conflict
+            temp_path = Path(tempfile.mkdtemp()) / filename
+            with open(temp_path, "wb") as temp_file:
+                temp_file.write(file_bytes)
             return conflict_resolution_page(
-                temp_path, existing_file["filepath"], batch_year, semester
+                temp_path, existing_zip["filepath"], batch_year, semester
             )
+        else:
+            # No conflict, upload directly
+            try:
+                upload_file_to_drive(file_bytes, f"{batch_year}_batch.zip", semester)
+                return RedirectResponse("/admin", status_code=303)
+            except Exception as e:
+                return Titled("Upload Error", P(f"Error uploading file: {str(e)}"))
 
     except Exception as e:
-        add_toast(session, f"Upload processing failed: {str(e)}", "error")
-        return RedirectResponse("/admin/upload", status_code=303)
+        return Titled("Error", P(f"An error occurred: {str(e)}"))
 
 
 @rt("/admin/upload/resolve", methods=["POST"])
-async def admin_upload_resolve(req, session):
+async def admin_upload_resolve(req):
+    """Handles the conflict resolution logic."""
     form = await req.form()
-    temp_file, existing_file_id = Path(form["temp"]), form["existing"]
-    action, confirm1, confirm2 = (
-        form["action"],
-        form.get("confirm1", ""),
-        form.get("confirm2", ""),
-    )
+    temp_file_path = form.get("temp")
+    existing_file_id = form.get("existing")
+    action = form.get("action")
+    confirm1 = form.get("confirm1")
+    confirm2 = form.get("confirm2")
 
     if action == "remove" and confirm1 == "REMOVE" and confirm2 == "REMOVE":
-        # Delete existing file and upload new one
-        DRIVE_SERVICE.files().delete(fileId=existing_file_id).execute()
-        with open(temp_file, "rb") as f:
-            file_bytes = f.read()
-        upload_file_to_drive(file_bytes, temp_file.name, "Semester")
-        temp_file.unlink()
-        add_toast(
-            session,
-            "Replaced file in Drive",
-            "success",
-        )
-        return RedirectResponse("/admin")
-    elif action == "merge":
+        # Delete existing and replace
         try:
-            with open(temp_file, "rb") as f:
-                new_file_bytes = f.read()
-            merge_zip_files_in_drive(existing_file_id, new_file_bytes)
-            temp_file.unlink()
-            add_toast(
-                session,
-                "Merged new zip in Drive",
-                "success",
-            )
-            return RedirectResponse("/admin")
-        except Exception as e:
-            add_toast(session, f"Merge failed: {str(e)}", "error")
-            temp_file.unlink()
-            return RedirectResponse("/admin/upload", status_code=303)
-
-    temp_file.unlink()
-    add_toast(session, "Resolution not confirmed or invalid action.", "error")
-    return RedirectResponse("/admin/upload", status_code=303)
-
-
-@rt("/admin/delete", methods=["GET", "POST"])
-async def admin_delete(req, session):
-    file_id = req.query_params.get("file")
-
-    if not file_id:
-        print("Error: No file ID provided in the query parameters.")
-        return PlainTextResponse("Invalid file parameter", status_code=400)
-
-    if req.method == "GET":
-        # Fetch file metadata to display filename
-        try:
-            print(f"Attempting to fetch file metadata for file ID: {file_id}")
-            file_metadata = (
-                DRIVE_SERVICE.files().get(fileId=file_id, fields="name").execute()
-            )
-            filename = file_metadata.get("name", "Unknown File")
-            print(f"File name retrieved: {filename}")
-        except errors.HttpError as error:  # Catch the Google API errors specifically
-            print(f"An error occurred: {error}")
-            filename = "Unknown File"
-        except Exception as e:
-            print(f"An unexpected error occurred: {e}")
-            filename = "Unknown File"
-
-        return Titled(
-            "Confirm Deletion",
-            P(f"Are you sure you want to delete {filename}?"),
-            Form(method="post")(
-                Input(type="hidden", name="file", value=file_id),
-                Label(
-                    "Type DELETE to confirm:", Input(type="text", name="confirmation")
-                ),
-                Label("Admin Password:", Input(type="password", name="password")),
-                Button("Delete", type="submit"),
-            ),
-        )
-
-    form = await req.form()
-    confirmation = form.get("confirmation")
-    password = form.get("password")
-
-    print(f"Confirmation input: {confirmation}")
-    print(
-        f"Password input: {'*' * len(password) if password else None}"
-    )  # Mask password
-
-    if confirmation == "DELETE" and password == ADMIN_PASSWD:
-        try:
-            # Check file modification time
-            print(f"Attempting to fetch file modification time for file ID: {file_id}")
-            file_metadata = (
-                DRIVE_SERVICE.files()
-                .get(fileId=file_id, fields="modifiedTime")
+            file_bytes = Path(temp_file_path).read_bytes()
+            semester = next(
+                semester
+                for semester, folder_id in SEMESTER_FOLDER_IDS.items()
+                if folder_id
+                in DRIVE_SERVICE.files()
+                .get(fileId=existing_file_id, fields="parents", supportsAllDrives=True)
                 .execute()
+                .get("parents", [])
             )
-            mod_time = datetime.datetime.fromisoformat(
-                file_metadata.get("modifiedTime", "").replace("Z", "+00:00")
-            )
-
-            print(f"File modification time: {mod_time}")
-
-            # Make utcnow() timezone-aware
-            utc_now = datetime.datetime.utcnow().replace(tzinfo=pytz.utc)
-
-            # Check if file is within 24 hours
-            if (utc_now - mod_time).total_seconds() <= 86400:
-                print(f"Attempting to delete file with ID: {file_id}")
-                DRIVE_SERVICE.files().delete(fileId=file_id).execute()
-                add_toast(session, "File deleted", "success")
-                print(f"Successfully deleted file with ID: {file_id}")
-            else:
-                add_toast(session, "Cannot delete file older than 24 hours", "error")
-                print("Error: Cannot delete file older than 24 hours")
-        except errors.HttpError as error:  # Catch the Google API errors specifically
-            print(f"An Google API error occurred: {error}")
-            add_toast(session, f"Deletion failed: {str(error)}", "error")
+            batch_year = Path(temp_file_path).stem.split("_")[0]  # Extract year
+            delete_file_in_drive(existing_file_id)
+            upload_file_to_drive(
+                file_bytes, Path(temp_file_path).name, semester
+            )  # Use original filename
+            shutil.rmtree(Path(temp_file_path).parent)  # Clean up temp dir
+            return RedirectResponse("/admin", status_code=303)
         except Exception as e:
-            print(f"An unexpected error occurred during deletion: {e}")
-            add_toast(session, f"Deletion failed: {str(e)}", "error")
+            return Titled("Error", P(f"Error replacing file: {str(e)}"))
+
+    elif action == "merge":
+        # Merge the files
+        try:
+            file_bytes = Path(temp_file_path).read_bytes()
+            merge_zip_files_in_drive(existing_file_id, file_bytes)
+            shutil.rmtree(Path(temp_file_path).parent)  # Clean up temp dir
+            return RedirectResponse("/admin", status_code=303)
+        except Exception as e:
+            return Titled("Error", P(f"Error merging files: {str(e)}"))
+
+    else:
+        return Titled(
+            "Error", P("Invalid action or confirmation. Go back and try again.")
+        )
+
+
+# === FILE DELETION ===
+@rt("/admin/delete")
+def admin_delete(req, session):
+    file_id = req.query.get("file")
+    if not file_id:
+        return Titled("Error", P("No file specified."))
+
+    if delete_file_in_drive(file_id):
         return RedirectResponse("/admin", status_code=303)
+    else:
+        return Titled("Error", P("Failed to delete file."))
 
 
-# === USER INTERFACE ===
+# === SEMESTER VIEW ===
+@rt("/semester/{semester}")
+def semester_view(req, semester):
+    files = list_files_in_semester(semester)
+    if not files:
+        return Titled("Semester View", P("No files in this semester."))
 
+    # Determine if any files are selected
+    any_files_selected = len(files) > 0
 
-@rt("/")
-def user_index(req):
+    # Define the base URL for downloads
+    base_url = f"/download/{semester}"
+
+    # Generate unique IDs for the "Download All" link and the "Download Selected" button
+    download_all_id = f"downloadAll-{semester}"
+    download_selected_id = f"downloadSelected-{semester}"
+
     return Titled(
-        "Data Science Resources",
-        Ul(*[Li(A(f"Semester {i}", href=f"/semester/{i}")) for i in range(1, 9)]),
-        P(A("Admin Login", href="/admin/login")),
+        f"Semester {semester}",
+        Form(
+            _id="fileListForm",
+            hx_target="this",
+            hx_on="htmx:after-request: if (event.detail.successful) { this.reset(); }",
+        )(
+            Ul(
+                *[
+                    Li(
+                        Label(
+                            Input(
+                                type="checkbox",
+                                name="selected_files",
+                                value=file["filepath"],
+                                _id=f"file-{file['filepath']}",
+                            ),
+                            file["filename"],
+                        )
+                    )
+                    for file in files
+                ]
+            ),
+            # "Download All" link using hx-post
+            A(
+                "Download All",
+                href=base_url,
+                hx_post=base_url,
+                hx_trigger="click",
+                hx_swap="none",
+                _id=download_all_id,
+            ),
+            # "Download Selected" button, conditionally displayed
+            Button(
+                "Download Selected",
+                hx_post=f"{base_url}/selected",
+                hx_include="#fileListForm",
+                hx_trigger="click",
+                hx_swap="none",
+                _id=download_selected_id,
+                style="display:none" if not any_files_selected else "",
+            ),
+            Script(
+                """
+                document.addEventListener('DOMContentLoaded', function() {
+                    const form = document.getElementById('fileListForm');
+                    const downloadSelectedButton = document.getElementById('"""
+                + download_selected_id
+                + """');
+
+                    form.addEventListener('change', function() {
+                        const checkboxes = document.querySelectorAll('input[name="selected_files"]:checked');
+                        if (checkboxes.length > 0) {
+                            downloadSelectedButton.style.display = 'inline-block';
+                        } else {
+                            downloadSelectedButton.style.display = 'none';
+                        }
+                    });
+                });
+                """
+            ),
+        ),
     )
 
 
-@rt("/semester/{num}", methods=["GET", "POST"])
-async def semester_view(req: Request, num: int):
-    semester = f"Semester_{num}"
-    if semester not in SEMESTER_FOLDER_IDS:
-        return Response("Semester not found", status_code=404)
-
+# === FILE DOWNLOAD ===
+@rt("/download/{semester}", methods=["POST", "GET"])
+async def download_all(req, semester):
+    """Zips and sends all files for a semester."""
     files = list_files_in_semester(semester)
+    if not files:
+        return Response("No files to download", status_code=404)
 
-    if req.method == "POST":
-        return RedirectResponse(f"/semester/{num}/download", status_code=303)
-
-    form_content = [
-        P(f"Total {len(files)} files"),
-        Ul(
-            *[
-                Li(
-                    Label(
-                        Input(type="checkbox", name="selected", value=f["filepath"]),
-                        " ",
-                        Span(f["filename"]),
-                    )
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+        for file in files:
+            try:
+                file_content = download_file_from_drive(file["filepath"])
+                zip_file.writestr(file["filename"], file_content)
+            except Exception as e:
+                print(f"Error downloading {file['filename']}: {e}")
+                return Response(
+                    f"Error downloading {file['filename']}", status_code=500
                 )
-                for f in files
-            ]
-        ),
-        Div(
-            Button(
-                "Download Selected",
-                type="submit",
-                name="action",
-                value="selected",
-                formaction=f"/semester/{num}/download",
-            ),
-            Button(
-                "Download All",
-                type="submit",
-                name="action",
-                value="all",
-                formaction=f"/semester/{num}/download",
-            ),
-        ),
-        P(A("Back to Home", href="/")),
-    ]
 
-    return Titled(f"Semester {num}", Form(*form_content, method="post"))
+    zip_buffer.seek(0)
+    headers = {
+        "Content-Type": "application/zip",
+        "Content-Disposition": f'attachment; filename="{semester}_files.zip"',
+    }
+    return Response(zip_buffer.read(), headers=headers)
 
 
-@rt("/semester", methods=["GET", "POST"])
-async def semester_select(req):
-    # Handle form submission
-    if req.method == "POST":
-        form = await req.form()
-        semester_num = form.get("semester")
-        if semester_num:
-            return RedirectResponse(
-                f"/semester/{semester_num}", status_code=303
-            )  # Redirect to semester view
-        else:
-            return PlainTextResponse("No semester selected")
-
-    # Build the HTML form
-    form_content = [
-        Label("Select Semester:"),
-        Select(*[Option(str(i), value=str(i)) for i in range(1, 9)], name="semester"),
-        Button("View Semester Files", type="submit"),
-    ]
-    return Titled("Select Semester", Form(form_content, method="post"))
-
-
-@rt("/semester/{num}/download", methods=["POST"])
-async def semester_download(req, num: int):
+@rt("/download/{semester}/selected", methods=["POST"])
+async def download_selected(req, semester):
+    """Zips and sends selected files for a semester."""
     form = await req.form()
-    action = form.get("action")
-    semester = f"Semester_{num}"
+    selected_files = form.getall("selected_files")
 
-    try:
-        if action == "selected":
-            selected = form.getlist("selected")
-            if not selected:
-                raise ValueError("No files selected")
-            file_ids = selected
+    if not selected_files:
+        return Response("No files selected", status_code=400)
 
-        elif action == "all":
-            files = list_files_in_semester(semester)
-            file_ids = [f["filepath"] for f in files]
-
-        else:
-            raise ValueError("Invalid action")
-
-        # Create in-memory ZIP file
-        zip_buffer = io.BytesIO()
-        with zipfile.ZipFile(zip_buffer, "w") as zf:
-            for file_id in file_ids:
-                try:
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+        for file_id in selected_files:
+            try:
+                file_info = next(
+                    (
+                        f
+                        for f in list_files_in_semester(semester)
+                        if f["filepath"] == file_id
+                    ),
+                    None,
+                )
+                if file_info:
                     file_content = download_file_from_drive(file_id)
-                    file_info = DRIVE_SERVICE.files().get(fileId=file_id).execute()
-                    zf.writestr(file_info["name"], file_content)
-                except Exception as e:
-                    print(f"Error processing {file_id}: {str(e)}")
-                    continue
+                    zip_file.writestr(file_info["filename"], file_content)
+                else:
+                    print(f"File with ID {file_id} not found in semester {semester}")
+                    return Response(
+                        f"File with ID {file_id} not found", status_code=404
+                    )
+            except Exception as e:
+                print(f"Error downloading file {file_id}: {e}")
+                return Response(f"Error downloading file {file_id}", status_code=500)
 
-        zip_buffer.seek(0)
-        return Response(
-            content=zip_buffer.getvalue(),
-            media_type="application/zip",
-            headers={
-                "Content-Disposition": f"attachment; filename=semester_{num}_files.zip"
-            },
-        )
-
-    except Exception as e:
-        return Titled("Download Error", P(str(e)), A("Back", href=f"/semester/{num}"))
-
-
-@rt("/download")
-def download_file(req):
-    try:
-        file_id = req.query_params["file"]
-        file_content = download_file_from_drive(file_id)
-        temp_file = TEMP_UPLOADS / f"{uuid.uuid4().hex}.zip"
-        temp_file.write_bytes(file_content)
-        return FileResponse(str(temp_file), filename=temp_file.name)
-    except Exception:
-        return PlainTextResponse("Invalid file parameter", status_code=400)
+    zip_buffer.seek(0)
+    headers = {
+        "Content-Type": "application/zip",
+        "Content-Disposition": f'attachment; filename="selected_files.zip"',
+    }
+    return Response(zip_buffer.read(), headers=headers)
 
 
-# === APPLICATION INITIALIZATION ===
-# Initialize Drive
-try:
+# === STATIC FILES ===
+app.add_static_route("/static", Path("./static"))
+
+# === START THE SERVER ===
+if __name__ == "__main__":
     SEMESTER_FOLDER_IDS = initialize_drive()
-    print("Drive initialization successful")
-except Exception as e:
-    print(f"Fatal error during initialization: {str(e)}")
-    print("Cannot continue without proper Drive access")
-    exit(1)
-
-
-# Ensure temp uploads directory exists
-TEMP_UPLOADS = Path("temp_uploads")
-TEMP_UPLOADS.mkdir(exist_ok=True)
-# === RUN THE APP ===
-serve()
+    app.run(port=8000)
